@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "esp32-root"
+		},
+		{
+			"name": "esp32-node",
+			"path": "esp32-node"
+		}
+	],
+	"settings": {}
+}
