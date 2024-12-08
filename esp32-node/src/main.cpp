@@ -95,7 +95,7 @@ void setup() {
   Serial.println("' to connect");
 
   pinMode(4, OUTPUT);
-  controlFlash(true); // Ensure flash is off initially
+  controlFlash(false); // Ensure flash is off initially
 }
 
 void loop() {

@@ -17,13 +17,23 @@
 #include "img_converters.h"
 #include "camera_index.h"
 #include "Arduino.h"
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include "base64.h"
+#include "mbedtls/base64.h"
+#include <queue>
+#include <mutex>
 
 #include "fb_gfx.h"
 #include "fd_forward.h"
 #include "fr_forward.h"
 
+extern void controlFlash(bool state);
+
 #define ENROLL_CONFIRM_TIMES 5
 #define FACE_ID_SAVE_NUMBER 7
+
+#define MQTT_MAX_PACKET_SIZE 1024
 
 #define FACE_COLOR_WHITE  0x00FFFFFF
 #define FACE_COLOR_BLACK  0x00000000
@@ -34,18 +44,34 @@
 #define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
+#define MQTT_SERVER "45.80.181.181"
+#define MQTT_PORT 1883
+#define MQTT_USER "forback"
+#define MQTT_PASS "forback2024"
+#define MQTT_TOPIC "esp32/image"
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 typedef struct {
-        size_t size; //number of values used for filtering
-        size_t index; //current value index
-        size_t count; //value count
+        size_t size;
+        size_t index;
+        size_t count;
         int sum;
-        int * values; //array to be filled with values
+        int * values;
 } ra_filter_t;
 
 typedef struct {
         httpd_req_t *req;
         size_t len;
 } jpg_chunking_t;
+
+typedef struct {
+        String topic;
+        String data;
+} Chunk;
+
+std::queue<Chunk> chunkQueue;
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -220,7 +246,12 @@ static esp_err_t capture_handler(httpd_req_t *req){
     esp_err_t res = ESP_OK;
     int64_t fr_start = esp_timer_get_time();
 
+    controlFlash(true); // Turn on flash
+    delay(100); // Small delay to ensure flash is on
+
     fb = esp_camera_fb_get();
+    controlFlash(false); // Turn off flash
+
     if (!fb) {
         Serial.println("Camera capture failed");
         httpd_resp_send_500(req);
@@ -449,7 +480,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
     return res;
 }
 
-extern void controlFlash(bool state); // Declare the function from main.cpp
+extern void controlFlash(bool state);
 
 static esp_err_t cmd_handler(httpd_req_t *req){
     char*  buf;
@@ -593,8 +624,131 @@ static esp_err_t index_handler(httpd_req_t *req){
     return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
 }
 
+String base64Encode(uint8_t *data, size_t len) {
+    size_t encoded_len = 4 * ((len + 2) / 3);
+    char *encoded_data = (char *)malloc(encoded_len + 1);
+
+    if (encoded_data == nullptr) {
+        Serial.println("Memory allocation failed for Base64 encoding");
+        return "";
+    }
+
+    if (mbedtls_base64_encode((unsigned char *)encoded_data, encoded_len + 1, &encoded_len, data, len) == 0) {
+        encoded_data[encoded_len] = '\0';
+        String result = String(encoded_data);
+        free(encoded_data);
+        return result;
+    } else {
+        Serial.println("Base64 encoding failed!");
+        free(encoded_data);
+        return "";
+    }
+}
+
+void enqueueChunk(String topic, String data) {
+    Chunk chunk = {topic, data};
+    chunkQueue.push(chunk);
+}
+
+void processQueue() {
+    while (!chunkQueue.empty()) {
+        Chunk chunk = chunkQueue.front();
+        bool sent = false;
+        for (int i = 0; i < 3; i++) { // Retry up to 3 times
+            if (client.publish(chunk.topic.c_str(), chunk.data.c_str(), chunk.data.length())) {
+                sent = true;
+                break;
+            }
+            delay(100); // Small delay before retrying
+        }
+        if (!sent) {
+            Serial.println("Failed to send chunk after retries!");
+            return;
+        }
+        chunkQueue.pop();
+    }
+
+    if (!client.publish((String(MQTT_TOPIC) + "/done").c_str(), "done")) {
+        Serial.println("Failed to send completion message!");
+    }
+
+    Serial.println("Image transmission completed.");
+}
+
+void sendImageBase64(camera_fb_t *fb) {
+    String encodedImage = base64Encode(fb->buf, fb->len);
+    if (encodedImage == "") {
+        Serial.println("Failed to encode image to Base64!");
+        return;
+    }
+
+    const int chunkSize = 1024;
+    int totalChunks = (encodedImage.length() + chunkSize - 1) / chunkSize;
+
+    Serial.println("Sending image in chunks...");
+    Serial.println("Total chunks: " + String(totalChunks));
+
+    for (int i = 0; i < totalChunks; i++) {
+        String chunk = encodedImage.substring(i * chunkSize, (i + 1) * chunkSize);
+        String topic = String(MQTT_TOPIC) + "/chunk/" + String(i);
+
+        enqueueChunk(topic, chunk);
+    }
+
+    enqueueChunk((String(MQTT_TOPIC) + "/done"), "done");
+    processQueue();
+}
+
+static esp_err_t publish_handler(httpd_req_t *req) {
+    camera_fb_t * fb = esp_camera_fb_get();
+
+    controlFlash(true); // Turn on flash
+    delay(100); // Small delay to ensure flash is on
+
+    fb = esp_camera_fb_get();
+    controlFlash(false); // Turn off flash
+
+    if (fb) {
+        sendImageBase64(fb);
+        esp_camera_fb_return(fb);
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "Image published", HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    if (!client.connected()) {
+        if (!client.connect("ESP32Client", MQTT_USER, MQTT_PASS)) {
+            Serial.println("MQTT connection failed");
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+    }
+
+    if (client.publish("test/topic", "Hello World")) {
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "Message published", HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+}
+
 void startCameraServer(){
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    client.setServer(MQTT_SERVER, MQTT_PORT);
+    client.setCallback([](char* topic, byte* payload, unsigned int length) {});
+
+    if (!client.connect("ESP32Client", MQTT_USER, MQTT_PASS)) {
+        Serial.println("MQTT connection failed");
+        return;
+    }
+
+    client.publish("test/topic", "ESP32 connected");
 
     httpd_uri_t index_uri = {
         .uri       = "/",
@@ -631,6 +785,12 @@ void startCameraServer(){
         .user_ctx  = NULL
     };
 
+    httpd_uri_t publish_uri = {
+        .uri       = "/publish",
+        .method    = HTTP_GET,
+        .handler   = publish_handler,
+        .user_ctx  = NULL
+    };
 
     ra_filter_init(&ra_filter, 20);
     
@@ -656,6 +816,7 @@ void startCameraServer(){
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
+        httpd_register_uri_handler(camera_httpd, &publish_uri);
     }
 
     config.server_port += 1;
