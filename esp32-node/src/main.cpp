@@ -8,6 +8,10 @@
 
 const char* ssid = "DESKTOP-5AJS436 4673";
 const char* password = "081281083891";
+// const char* ssid = "Giovan Christoffel's A54";
+// const char* password = "ebmagab2kyeavhb";
+// const char* ssid = "sisesahouse.net";
+// const char* password = "";
 
 void startCameraServer();
 

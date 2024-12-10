@@ -740,15 +740,15 @@ static esp_err_t publish_handler(httpd_req_t *req) {
 void startCameraServer(){
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-    client.setServer(MQTT_SERVER, MQTT_PORT);
-    client.setCallback([](char* topic, byte* payload, unsigned int length) {});
+    // client.setServer(MQTT_SERVER, MQTT_PORT);
+    // client.setCallback([](char* topic, byte* payload, unsigned int length) {});
 
-    if (!client.connect("ESP32Client", MQTT_USER, MQTT_PASS)) {
-        Serial.println("MQTT connection failed");
-        return;
-    }
+    // if (!client.connect("ESP32Client", MQTT_USER, MQTT_PASS)) {
+        // Serial.println("MQTT connection failed");
+        // return;
+    // }
 
-    client.publish("test/topic", "ESP32 connected");
+    // client.publish("test/topic", "ESP32 connected");
 
     httpd_uri_t index_uri = {
         .uri       = "/",
